@@ -2,6 +2,9 @@
 import os
 import json
 import argparse
+import curses
+import shlex
+import shutil
 import subprocess
 import sys
 
@@ -13,7 +16,7 @@ except ImportError:
     os.sys.exit(1)
 
 try:
-    from pick import pick
+    from pick import pick, Picker
 except ImportError:
     print("Error: The 'pick' module is not installed.")
     print("Please install it using: pip install pick")
@@ -24,13 +27,29 @@ CONFIG_DIR = os.path.join(HOME, ".config/scopebuddy")
 APPID_DIR = os.path.join(CONFIG_DIR, "AppID")
 GLOBAL_CONFIG = os.path.join(CONFIG_DIR, "scb.conf")
 DATABASE_FILE = os.path.join(CONFIG_DIR, "scopeedit.db")
-EDITOR = os.environ.get("EDITOR", "nano")  # default editor to nano
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "scopeedit.json")
 GLOBAL_FILES = [file for file in os.listdir(CONFIG_DIR) if file.endswith(".conf") and file != "scopeedit.db"]
+DEFAULT_SETTINGS = {"page_size": "auto", "editor": "", "show_appid": True, "show_hidden": False}
+SETTINGS = dict(DEFAULT_SETTINGS)
 
 def debug(message):
     """Prints debug messages to stderr if the DEBUG environment variable is set."""
     if os.environ.get("DEBUG"):
         print(f"DEBUG: {message}", file=sys.stderr)
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r") as f:
+            SETTINGS.update(json.load(f))
+        debug(f"Loaded settings: {SETTINGS}")
+
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(SETTINGS, f, indent=2)
+    debug(f"Saved settings: {SETTINGS}")
+
+def get_editor():
+    return SETTINGS["editor"] or os.environ.get("EDITOR", "nano")  # default editor to nano
 
 def get_game_name(app_id):
     """Gets the game name from the database or the Steam API using requests."""
@@ -91,43 +110,148 @@ def search_game_by_name(game_name):
     except (json.JSONDecodeError, KeyError) as e:
         debug(f"Error parsing game search results: {e}")
         return []
-    
+
+def get_game_configs():
+    """Returns (label, path) for each per-game config, sorted by game name."""
+    configs = []
+    for file in os.listdir(APPID_DIR):
+        hidden = file.endswith(".conf.disabled")
+        if file.endswith(".conf") or (hidden and SETTINGS["show_hidden"]):
+            debug(f"Found potential config file: {file}")
+            app_id = file.split(".")[0]
+            label = get_game_name(app_id)
+            if SETTINGS["show_appid"]:
+                label += f" (AppID: {app_id})"
+            if hidden:
+                label += " [disabled]"
+            configs.append((label, os.path.join(APPID_DIR, file)))
+    return sorted(configs, key=lambda c: c[0].lower())
+
+def get_page_size(fixed_rows):
+    if SETTINGS["page_size"] != "auto":
+        return SETTINGS["page_size"]
+    # pick draws the title (up to 2 rows when wrapped) and a blank line above the options; keep 1 spare row
+    return max(1, shutil.get_terminal_size().lines - 4 - fixed_rows)
+
+def pick_game(title, top_options, bottom_options, on_right=None):
+    """Shows configs one page at a time. Returns the selected config path or option string.
+    If on_right is given, pressing Right on a game calls on_right(path) and redraws the same page."""
+    page = 0
+    cursor = 0
+    while True:
+        # Reloaded each time so resizes and on_right changes show up; 2 rows reserved for Next/Previous
+        configs = get_game_configs()
+        page_size = get_page_size(len(top_options) + len(bottom_options) + 2)
+        total = max(1, (len(configs) + page_size - 1) // page_size)
+        page = min(page, total - 1)
+        page_configs = configs[page * page_size:(page + 1) * page_size]
+        nav = []
+        if page < total - 1:
+            nav.append("Next Page")
+        if page > 0:
+            nav.append("Previous Page")
+        options = top_options + [label for label, _ in page_configs] + nav + bottom_options
+        page_title = f"{title} (Page {page + 1}/{total}{', Right: actions' if on_right else ''})"
+        picker = Picker(options, page_title, indicator='->', default_index=min(cursor, len(options) - 1),
+                        quit_keys=(curses.KEY_RIGHT,) if on_right else None)
+        selected = picker.start()
+        index = picker.index - len(top_options)
+        if selected[1] == -1:  # Right pressed
+            if 0 <= index < len(page_configs):
+                on_right(page_configs[index][1])
+            cursor = picker.index
+            continue
+        cursor = 0
+        if 0 <= index < len(page_configs):
+            return page_configs[index][1]
+        if selected[0] == "Next Page":
+            page += 1
+        elif selected[0] == "Previous Page":
+            page -= 1
+        else:
+            return selected[0]
+
+def open_in_editor(config_file):
+    try:
+        debug(f"Opening {config_file} with {get_editor()}")
+        subprocess.run(shlex.split(get_editor()) + [config_file], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error opening file with {get_editor()}: {e}")
+
+def toggle_disabled(config_file):
+    """Disables a config by renaming it to .disabled, or enables it again."""
+    name = get_game_name(os.path.basename(config_file).split(".")[0])
+    if config_file.endswith(".disabled"):
+        new_file = config_file[:-9]  # Remove .disabled
+        action = "enabled"
+    else:
+        new_file = config_file + ".disabled"
+        action = "disabled"
+    try:
+        os.rename(config_file, new_file)
+        print(f"Configuration {action}: {name}")
+        debug(f"Renamed {config_file} to {new_file}")
+    except OSError as e:
+        print(f"Error renaming configuration: {e}")
+
+def game_actions(config_file):
+    """Side menu for a single game, opened with Right. Left or Back returns."""
+    name = get_game_name(os.path.basename(config_file).split(".")[0])
+    options = ["Edit", "Enable" if config_file.endswith(".disabled") else "Disable", "Back"]
+    selected = pick(options, f"{name}: (Left: back)", indicator='->', quit_keys=(curses.KEY_LEFT,))
+    if selected[0] == "Edit":
+        open_in_editor(config_file)
+    elif selected[0] in ("Enable", "Disable"):
+        toggle_disabled(config_file)
+
 def remove_config():
     """Hides a configuration file by renaming it."""
     debug("remove_config called")
-    
-    config_files = []
-    config_list = []
 
-    for file in os.listdir(APPID_DIR):
-        if file.endswith(".conf"):
-            app_id = file[:-5]
-            game_name = get_game_name(app_id)
-            config_files.append(os.path.join(APPID_DIR, file))
-            config_list.append(f"{game_name} (AppID: {app_id})")
-
-    if not config_list:
+    if not get_game_configs():
         print("No configurations to remove.")
         return
 
-    config_list.append("Back")
-    title = "Select a configuration to remove (hide):"
-    selected = pick(config_list, title, indicator='->', multiselect=False)
-    choice = selected[0]
+    title = "Select a configuration to remove (disable):"
+    if SETTINGS["show_hidden"]:
+        title = "Select a configuration to remove (disable) or restore:"
+    selected_file = pick_game(title, [], ["Back"])
 
-    if choice == "Back":
-        return
+    if selected_file != "Back":
+        toggle_disabled(selected_file)
 
-    index = config_list.index(choice)
-    selected_file = config_files[index]
-    disabled_file = selected_file + ".disabled"
+def options_menu():
+    """Edits and saves scopeedit settings."""
+    debug("options_menu called")
+    while True:
+        options = [
+            f"Games per page: {'Auto (fit window)' if SETTINGS['page_size'] == 'auto' else SETTINGS['page_size']}",
+            f"Editor: {SETTINGS['editor'] or '$EDITOR (' + get_editor() + ')'}",
+            f"Show AppID in list: {'On' if SETTINGS['show_appid'] else 'Off'}",
+            f"Show disabled configs: {'On' if SETTINGS['show_hidden'] else 'Off'}",
+            "Back",
+        ]
+        selected = pick(options, "Options:", indicator='->', multiselect=False)
+        index = selected[1]
 
-    try:
-        os.rename(selected_file, disabled_file)
-        print(f"Configuration removed from list: {choice}")
-        debug(f"Renamed {selected_file} to {disabled_file}")
-    except OSError as e:
-        print(f"Error removing configuration: {e}")
+        if index == 0:
+            value = input("Games per page (number, or blank for auto): ").strip()
+            if not value:
+                SETTINGS["page_size"] = "auto"
+            elif value.isdigit() and int(value) > 0:
+                SETTINGS["page_size"] = int(value)
+            else:
+                print("Invalid number.")
+                continue
+        elif index == 1:
+            SETTINGS["editor"] = input("Editor command (blank to use $EDITOR): ").strip()
+        elif index == 2:
+            SETTINGS["show_appid"] = not SETTINGS["show_appid"]
+        elif index == 3:
+            SETTINGS["show_hidden"] = not SETTINGS["show_hidden"]
+        else:
+            return
+        save_settings()
 
 def edit_global():
     debug("edit_global called")
@@ -154,10 +278,10 @@ def edit_global():
         
         #Open the editor with Popen
         try:
-            debug(f"Opening {file} with {EDITOR}")
-            subprocess.run([EDITOR, file], check=True)
+            debug(f"Opening {file} with {get_editor()}")
+            subprocess.run(shlex.split(get_editor()) + [file], check=True)
         except subprocess.CalledProcessError as e:
-            print(f"Error opening file with {EDITOR}: {e}")
+            print(f"Error opening file with {get_editor()}: {e}")
             os.sys.exit(1)
 
 def list_configs():
@@ -174,43 +298,10 @@ def list_configs():
         with open(DATABASE_FILE, "w") as f:
             pass
 
-    config_files = []
-    config_list = []
-
-    # Global Config (now a submenu option)
-    config_list.append("Global Configuration")
-
-    # Per-game configs
-    debug(f"Searching for per-game configs in: {APPID_DIR}")
-    for file in os.listdir(APPID_DIR):
-        if file.endswith(".conf"):
-            debug(f"Found potential config file: {file}")
-            app_id = file[:-5]  # Remove .conf
-            debug(f"Extracted AppID: {app_id}")
-            game_name = get_game_name(app_id)
-            debug(f"Game name for AppID {app_id}: {game_name}")
-            config_files.append(os.path.join(APPID_DIR, file))
-            config_list.append(f"{game_name} (AppID: {app_id})")
-
-    if not config_list:
-        debug("No configurations found.")
-        print("No configurations found.")
-        print("Press N to create a new one.")
-        create_new_config()
-        return True
-
-    config_list.append("")
-    config_list.append("Create New Configuration")
-    config_list.append("Remove Configuration")
-    config_list.append("Quit")
-
-    debug(f"Configurations found: {config_list}")
     title = "Select a ScopeBuddy configuration to edit:"
-    options = config_list
-    selected = pick(options, title, indicator='->', multiselect=False)
-
-    choice = selected[0]
-    index = config_list.index(choice)
+    choice = pick_game(title, ["Global Configuration"],
+                       ["", "Create New Configuration", "Remove Configuration", "Options", "Quit"],
+                       on_right=game_actions)
 
     if choice == "Quit":
         print("Exiting...")
@@ -223,23 +314,21 @@ def list_configs():
     elif choice == "Remove Configuration":
         remove_config()
         return True
+    elif choice == "Options":
+        options_menu()
+        return True
     elif choice == "Global Configuration":
         edit_global()
         return True
     else:
-        selected_config = config_files[index-1]
+        selected_config = choice
         debug(f"Selected config file: {selected_config}")
 
         if not os.path.exists(selected_config):
             print(f"Error: Config file not found: {selected_config}")
             return True
 
-        # Open the editor with Popen
-        try:
-            debug(f"Opening {selected_config} with {EDITOR}")
-            subprocess.run([EDITOR, selected_config], check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Error opening file with {EDITOR}: {e}")
+        open_in_editor(selected_config)
         return True
 
 def create_new_config():
@@ -294,10 +383,10 @@ def create_new_config():
                 return True
             
             try:
-                debug(f"Opening {new_config_file} with {EDITOR}")
-                subprocess.run([EDITOR, new_config_file], check=True)
+                debug(f"Opening {new_config_file} with {get_editor()}")
+                subprocess.run(shlex.split(get_editor()) + [new_config_file], check=True)
             except subprocess.CalledProcessError as e:
-                print(f"Error opening file with {EDITOR}: {e}")
+                print(f"Error opening file with {get_editor()}: {e}")
             return False
 
         game_name = get_game_name(app_id)
@@ -308,10 +397,10 @@ def create_new_config():
         print(f"Created new configuration: {new_config_file}")
         # open with Popen
         try:
-            debug(f"Opening {new_config_file} with {EDITOR}")
-            subprocess.run([EDITOR, new_config_file], check=True)
+            debug(f"Opening {new_config_file} with {get_editor()}")
+            subprocess.run(shlex.split(get_editor()) + [new_config_file], check=True)
         except subprocess.CalledProcessError as e:
-            print(f"Error opening file with {EDITOR}: {e}")
+            print(f"Error opening file with {get_editor()}: {e}")
             return True
 
         return False
@@ -322,6 +411,7 @@ def main():
     args = parser.parse_args()
     if args.debug:
         os.environ["DEBUG"] = "1"
+    load_settings()
     while list_configs():
         pass
 
