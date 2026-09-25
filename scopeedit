@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+import os
+import json
+import argparse
+import subprocess
+import sys
+
+try:
+    import requests
+except ImportError:
+    print("Error: The 'requests' module is not installed.")
+    print("Please install it using: pip install requests")
+    os.sys.exit(1)
+
+try:
+    from pick import pick
+except ImportError:
+    print("Error: The 'pick' module is not installed.")
+    print("Please install it using: pip install pick")
+    os.sys.exit(1)
+
+HOME = os.environ.get("HOME")
+CONFIG_DIR = os.path.join(HOME, ".config/scopebuddy")
+APPID_DIR = os.path.join(CONFIG_DIR, "AppID")
+GLOBAL_CONFIG = os.path.join(CONFIG_DIR, "scb.conf")
+DATABASE_FILE = os.path.join(CONFIG_DIR, "scopeedit.db")
+EDITOR = os.environ.get("EDITOR", "nano")  # default editor to nano
+GLOBAL_FILES = [file for file in os.listdir(CONFIG_DIR) if file.endswith(".conf") and file != "scopeedit.db"]
+
+def debug(message):
+    """Prints debug messages to stderr if the DEBUG environment variable is set."""
+    if os.environ.get("DEBUG"):
+        print(f"DEBUG: {message}", file=sys.stderr)
+
+def get_game_name(app_id):
+    """Gets the game name from the database or the Steam API using requests."""
+    debug(f"get_game_name called with app_id: {app_id}")
+
+    # Check database first
+    if os.path.exists(DATABASE_FILE):
+        with open(DATABASE_FILE, "r") as f:
+            for line in f:
+                db_app_id, db_name = line.strip().split(" ", 1)
+                if db_app_id == app_id:
+                    debug(f"Found game name in database: {db_name}")
+                    return db_name
+
+    # If not in database, use Steam API
+    debug(f"Fetching game name from Steam API for {app_id}")
+    try:
+        api_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}"
+        response = requests.get(api_url)  # Use requests.get()
+        response.raise_for_status()  # Raise an exception for bad status codes
+
+        api_data = response.json()  # Parse into json
+
+        if not api_data[app_id]['success']:
+            debug("Error: steam api returned success false")
+            return f"(Unknown Game - AppID: {app_id})"
+        name = api_data[app_id]["data"]["name"]
+        debug(f"Found game name from API: {name}")
+
+        # Add to database
+        with open(DATABASE_FILE, "a") as f:
+            f.write(f"{app_id} {name}\n")
+            debug(f"Added to database: {app_id} {name}")
+        return name
+
+    except requests.exceptions.RequestException as e:
+        debug(f"Error fetching game name from API: {e}")
+        return f"(Unknown Game - AppID: {app_id})"
+    except (json.JSONDecodeError, KeyError) as e:
+        debug(f"Error parsing game name: {e}")
+        return f"(Unknown Game - AppID: {app_id})"
+
+def search_game_by_name(game_name):
+    """Searches for a game on the Steam Store and returns a list of possible AppIDs and names."""
+    debug(f"search_game_by_name called with game_name: {game_name}")
+    try:
+        search_url = f"https://store.steampowered.com/api/storesearch/?term={game_name}&l=english&cc=us"  # search with English names
+        response = requests.get(search_url)
+        response.raise_for_status()
+        search_data = response.json()
+        results = []
+        for item in search_data["items"]:
+            results.append((item["id"], item["name"]))
+        return results
+    except requests.exceptions.RequestException as e:
+        debug(f"Error searching for game: {e}")
+        return []
+    except (json.JSONDecodeError, KeyError) as e:
+        debug(f"Error parsing game search results: {e}")
+        return []
+    
+def remove_config():
+    """Hides a configuration file by renaming it."""
+    debug("remove_config called")
+    
+    config_files = []
+    config_list = []
+
+    for file in os.listdir(APPID_DIR):
+        if file.endswith(".conf"):
+            app_id = file[:-5]
+            game_name = get_game_name(app_id)
+            config_files.append(os.path.join(APPID_DIR, file))
+            config_list.append(f"{game_name} (AppID: {app_id})")
+
+    if not config_list:
+        print("No configurations to remove.")
+        return
+
+    config_list.append("Back")
+    title = "Select a configuration to remove (hide):"
+    selected = pick(config_list, title, indicator='->', multiselect=False)
+    choice = selected[0]
+
+    if choice == "Back":
+        return
+
+    index = config_list.index(choice)
+    selected_file = config_files[index]
+    disabled_file = selected_file + ".disabled"
+
+    try:
+        os.rename(selected_file, disabled_file)
+        print(f"Configuration removed from list: {choice}")
+        debug(f"Renamed {selected_file} to {disabled_file}")
+    except OSError as e:
+        print(f"Error removing configuration: {e}")
+
+def edit_global():
+    debug("edit_global called")
+    if not GLOBAL_FILES:
+      print("No Global files found.")
+      return False
+    GLOBAL_FILES_LIST = []
+    for file in GLOBAL_FILES:
+        GLOBAL_FILES_LIST.append(file)
+    GLOBAL_FILES_LIST.append("Back")
+
+    title = "Select a Global Configuration to edit:"
+    selected = pick(GLOBAL_FILES_LIST, title, indicator='->', multiselect=False)
+    choice = selected[0]
+
+    if choice == "Back":
+        return False
+    else:
+        file = os.path.join(CONFIG_DIR, choice)
+
+        if not os.path.exists(file):
+            print(f"Error: Config file not found: {file}")
+            os.sys.exit(1)
+        
+        #Open the editor with Popen
+        try:
+            debug(f"Opening {file} with {EDITOR}")
+            subprocess.run([EDITOR, file], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error opening file with {EDITOR}: {e}")
+            os.sys.exit(1)
+
+def list_configs():
+    """Lists available configurations and handles user interaction."""
+    debug("list_configs called")
+
+    # Ensure config directories exist
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(APPID_DIR, exist_ok=True)
+
+    # Create Database if it doesn't exist
+    if not os.path.exists(DATABASE_FILE):
+        debug(f"DATABASE_FILE does not exist, creating: {DATABASE_FILE}")
+        with open(DATABASE_FILE, "w") as f:
+            pass
+
+    config_files = []
+    config_list = []
+
+    # Global Config (now a submenu option)
+    config_list.append("Global Configuration")
+
+    # Per-game configs
+    debug(f"Searching for per-game configs in: {APPID_DIR}")
+    for file in os.listdir(APPID_DIR):
+        if file.endswith(".conf"):
+            debug(f"Found potential config file: {file}")
+            app_id = file[:-5]  # Remove .conf
+            debug(f"Extracted AppID: {app_id}")
+            game_name = get_game_name(app_id)
+            debug(f"Game name for AppID {app_id}: {game_name}")
+            config_files.append(os.path.join(APPID_DIR, file))
+            config_list.append(f"{game_name} (AppID: {app_id})")
+
+    if not config_list:
+        debug("No configurations found.")
+        print("No configurations found.")
+        print("Press N to create a new one.")
+        create_new_config()
+        return True
+
+    config_list.append("")
+    config_list.append("Create New Configuration")
+    config_list.append("Remove Configuration")
+    config_list.append("Quit")
+
+    debug(f"Configurations found: {config_list}")
+    title = "Select a ScopeBuddy configuration to edit:"
+    options = config_list
+    selected = pick(options, title, indicator='->', multiselect=False)
+
+    choice = selected[0]
+    index = config_list.index(choice)
+
+    if choice == "Quit":
+        print("Exiting...")
+        return False
+    elif choice == "":
+        return True
+    elif choice == "Create New Configuration":
+        create_new_config()
+        return True
+    elif choice == "Remove Configuration":
+        remove_config()
+        return True
+    elif choice == "Global Configuration":
+        edit_global()
+        return True
+    else:
+        selected_config = config_files[index-1]
+        debug(f"Selected config file: {selected_config}")
+
+        if not os.path.exists(selected_config):
+            print(f"Error: Config file not found: {selected_config}")
+            return True
+
+        # Open the editor with Popen
+        try:
+            debug(f"Opening {selected_config} with {EDITOR}")
+            subprocess.run([EDITOR, selected_config], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error opening file with {EDITOR}: {e}")
+        return True
+
+def create_new_config():
+    """Creates a new configuration file."""
+    game_name = input("Enter the name of the game: ")
+    if not game_name:
+        print("Game name cannot be empty.")
+        return True
+
+    search_results = search_game_by_name(game_name)
+
+    if not search_results:
+        print(f"No games found matching '{game_name}'.")
+        app_id = input("Please enter the AppID manually or press enter to quit: ")
+        if not app_id:
+            return False
+    elif len(search_results) == 1:
+        app_id = search_results[0][0]
+        print(f"Found: {search_results[0][1]} ({app_id})")
+    else:
+        print("Multiple games found:")
+        options = [f"{name} ({app_id})" for app_id, name in search_results]
+        options.append("Enter AppID Manually")
+        title = "Select a Game"
+        selected = pick(options, title, indicator='->', multiselect=False)
+        if selected[0] == "Enter AppID Manually":
+            app_id = input("Please enter the AppID manually or press enter to quit: ")
+            if not app_id:
+                return False
+        else:
+            app_id = selected[0].split(" ")[-1].strip("()")
+
+    if app_id:
+        if not app_id.isdigit():
+            print("Invalid AppID. Please use numbers")
+            return True
+
+        new_config_file = os.path.join(APPID_DIR, f"{app_id}.conf")
+        disabled_config_file = new_config_file + ".disabled"
+
+        if os.path.exists(new_config_file):
+            print(f"Error: Configuration file for AppID {app_id} already exists.")
+            return True
+        
+        if os.path.exists(disabled_config_file):
+            print(f"Found disabled configuration. Restoring...")
+            try:
+                os.rename(disabled_config_file, new_config_file)
+                debug(f"Restored {disabled_config_file} to {new_config_file}")
+            except OSError as e:
+                print(f"Error restoring configuration: {e}")
+                return True
+            
+            try:
+                debug(f"Opening {new_config_file} with {EDITOR}")
+                subprocess.run([EDITOR, new_config_file], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error opening file with {EDITOR}: {e}")
+            return False
+
+        game_name = get_game_name(app_id)
+
+        with open(new_config_file, "w") as f:
+            f.write(f"# {game_name}\n")
+
+        print(f"Created new configuration: {new_config_file}")
+        # open with Popen
+        try:
+            debug(f"Opening {new_config_file} with {EDITOR}")
+            subprocess.run([EDITOR, new_config_file], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error opening file with {EDITOR}: {e}")
+            return True
+
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="ScopeBuddy configuration editor")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
+    args = parser.parse_args()
+    if args.debug:
+        os.environ["DEBUG"] = "1"
+    while list_configs():
+        pass
+
+if __name__ == "__main__":
+    main()
