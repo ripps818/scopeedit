@@ -7,44 +7,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk, Pango
 
+import legends
 import scopeedit as se
-
-# From /usr/bin/scopebuddy 1.5.0: (group, [(name, default, description)])
-LEGEND = [
-    ("Set in a config", [
-        ("SCB_GAMESCOPE_ARGS", "", "Default gamescope args. Ignored if args are given before -- in the launch options, unless SCB_APPENDMODE=1. Use += to add to it."),
-        ("SCB_APPENDMODE", "0", "1 = always put SCB_GAMESCOPE_ARGS in front of the launch option args instead of being replaced by them."),
-        ("SCB_AUTO_RES", "0", "1 = set -W/-H from the current display resolution."),
-        ("SCB_AUTO_HDR", "0", "1 = add --hdr-enabled if HDR is on for the display. Without gamescope on the desktop it also exports PROTON_ENABLE_WAYLAND=1 and PROTON_ENABLE_HDR=1."),
-        ("SCB_AUTO_VRR", "0", "1 = add --adaptive-sync if VRR is on for the display."),
-        ("SCB_AUTO_REFRESH", "0", "1 = set -r to the display refresh rate."),
-        ("SCB_AUTO_FRAME_LIMIT", "0", "1 = set --framerate-limit to the display refresh rate."),
-        ("SCB_NOSCOPE", "0", "1 = launch the game without gamescope."),
-        ("SCB_NESTEDFIX", "1", "Fix for the Steam overlay and Steam Input in nested gamescope. 0 disables it."),
-        ("SCB_DEBUG", "0", "1 = write the launch command to ~/.config/scopebuddy/scopebuddy.log."),
-        ("SCB_PRE_COMMAND", "", "Shell command run before gamescope starts (gamescope mode only)."),
-        ("SCB_POST_COMMAND", "", "Shell command run when the game exits."),
-    ]),
-    ("Launch options only", [
-        ("SCB_CONF", "scb.conf", "Global config to load. noscope.conf and gamemode.conf are picked automatically."),
-        ("SCB_APPID", "", "Override the detected AppID."),
-        ("SCB_STEAMARGIGNORE", "1", "Drop the -e/--steam gamescope flags, which currently crash gamescope."),
-        ("GAMESCOPE_BIN", "gamescope", "gamescope binary to run."),
-        ("KSCREEN_COMMAND", "kscreen-doctor", "KDE display tool used by SCB_AUTO_*."),
-        ("GDCTL_COMMAND", "gdctl", "GNOME display tool used by SCB_AUTO_*."),
-        ("GNOME_RANDR_COMMAND", "gnome-randr", "GNOME fallback display tool used by SCB_AUTO_*."),
-        ("WLR_RANDR_COMMAND", "wlr-randr", "wlroots display tool used by SCB_AUTO_*."),
-    ]),
-    ("Read-only, for scripting", [
-        ("SCB_CONFIGDIR", "", "The ScopeBuddy config folder, e.g. source $SCB_CONFIGDIR/hdr.conf"),
-        ("SCB_GAMEMODE", "", "1 when running in Steam Game Mode (SCB_NOSCOPE is then 1 too)."),
-        ("SCB_NOSCOPE", "", "1 when running without gamescope."),
-        ("SCB_APPID", "", "AppID of the game being launched."),
-        ("SCB_CONFIGFILE", "", "Full path of the global config that was loaded."),
-        ("SCB_VER", "", "ScopeBuddy version."),
-        ("command", "", "The expanded %command%. command+=\" ...\" adds game arguments."),
-    ]),
-]
 
 # (tag, regex, group), in increasing priority
 RULES = [
@@ -121,23 +85,34 @@ class Window(Gtk.ApplicationWindow):
         self.editor = Gtk.TextView(buffer=self.buffer, monospace=True, sensitive=False,
                                    left_margin=8, right_margin=8, top_margin=8, bottom_margin=8)
 
-        self.revealer = Gtk.Revealer(child=self.build_legend(), reveal_child=se.SETTINGS["show_legend"],
-                                     transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT)
-        right = Gtk.Box()
-        right.append(Gtk.ScrolledWindow(child=self.editor, hexpand=True))
-        right.append(self.revealer)
+        self.legend = self.build_legend()
+        self.legend.set_visible(se.SETTINGS["show_legend"])
+        # Drag the handles to resize the sidebar and the legend
+        right = Gtk.Paned(start_child=Gtk.ScrolledWindow(child=self.editor, hexpand=True), end_child=self.legend,
+                          wide_handle=True, shrink_start_child=False, shrink_end_child=False, resize_end_child=False)
 
-        paned = Gtk.Paned(start_child=sidebar, end_child=right, position=300,
+        paned = Gtk.Paned(start_child=sidebar, end_child=right, position=300, wide_handle=True,
                           shrink_start_child=False, resize_start_child=False)
         self.set_child(paned)
         self.connect("close-request", self.on_close_request)
         self.refresh_list()
 
     def build_legend(self):
+        builds = legends.find_proton_builds()
+        notebook = Gtk.Notebook(scrollable=True, width_request=240)
+        pages = [("ScopeBuddy", legends.SCOPEBUDDY)]
+        pages += [(family, legends.proton_legend(builds, family)) for family, _ in legends.PROTON_FAMILIES]
+        pages.append(("DXVK / VKD3D", legends.DXVK))
+        for label, groups in pages:
+            notebook.append_page(self.legend_page(groups), Gtk.Label(label=label))
+        return notebook
+
+    def legend_page(self, groups):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
                       margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
-        for group, entries in LEGEND:
-            heading = Gtk.Label(label=group, xalign=0, margin_top=10, margin_bottom=4)
+        for group, entries in groups:
+            heading = Gtk.Label(label=group, xalign=0, margin_top=10, margin_bottom=4,
+                                wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=38)
             heading.add_css_class("heading")
             box.append(heading)
             for name, default, description in entries:
@@ -148,7 +123,7 @@ class Window(Gtk.ApplicationWindow):
                 desc = Gtk.Label(label=description, xalign=0, wrap=True, selectable=True, max_width_chars=38)
                 desc.add_css_class("dim-label")
                 box.append(desc)
-        return Gtk.ScrolledWindow(child=box, width_request=340, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        return Gtk.ScrolledWindow(child=box, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
 
     def refresh_list(self):
         self.refreshing = True
@@ -275,7 +250,7 @@ class Window(Gtk.ApplicationWindow):
                 tag("comment", m.start(), m.end())
 
     def on_legend_toggled(self, button):
-        self.revealer.set_reveal_child(button.get_active())
+        self.legend.set_visible(button.get_active())
         se.SETTINGS["show_legend"] = button.get_active()
         se.save_settings()
 
