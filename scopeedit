@@ -7,20 +7,14 @@ import shlex
 import shutil
 import subprocess
 import sys
-
-try:
-    import requests
-except ImportError:
-    print("Error: The 'requests' module is not installed.")
-    print("Please install it using: pip install requests")
-    os.sys.exit(1)
+import urllib.error
+import urllib.parse
+import urllib.request
 
 try:
     from pick import pick, Picker
 except ImportError:
-    print("Error: The 'pick' module is not installed.")
-    print("Please install it using: pip install pick")
-    os.sys.exit(1)
+    pick = Picker = None  # only the CLI needs pick; checked in main()
 
 HOME = os.environ.get("HOME")
 CONFIG_DIR = os.path.join(HOME, ".config/scopebuddy")
@@ -29,7 +23,7 @@ GLOBAL_CONFIG = os.path.join(CONFIG_DIR, "scb.conf")
 DATABASE_FILE = os.path.join(CONFIG_DIR, "scopeedit.db")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "scopeedit.json")
 GLOBAL_FILES = [file for file in os.listdir(CONFIG_DIR) if file.endswith(".conf") and file != "scopeedit.db"]
-DEFAULT_SETTINGS = {"page_size": "auto", "editor": "", "show_appid": True, "show_hidden": False}
+DEFAULT_SETTINGS = {"page_size": "auto", "editor": "", "show_appid": True, "show_hidden": False, "show_legend": True}
 SETTINGS = dict(DEFAULT_SETTINGS)
 
 def debug(message):
@@ -52,7 +46,7 @@ def get_editor():
     return SETTINGS["editor"] or os.environ.get("EDITOR", "nano")  # default editor to nano
 
 def get_game_name(app_id):
-    """Gets the game name from the database or the Steam API using requests."""
+    """Gets the game name from the database or the Steam API."""
     debug(f"get_game_name called with app_id: {app_id}")
 
     # Check database first
@@ -68,15 +62,15 @@ def get_game_name(app_id):
     debug(f"Fetching game name from Steam API for {app_id}")
     try:
         api_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}"
-        response = requests.get(api_url)  # Use requests.get()
-        response.raise_for_status()  # Raise an exception for bad status codes
+        with urllib.request.urlopen(api_url, timeout=10) as response:
+            api_data = json.load(response)
 
-        api_data = response.json()  # Parse into json
-
-        if not api_data[app_id]['success']:
+        # Steam sometimes keys the reply by a different AppID, so take the only entry
+        app_data = next(iter(api_data.values()))
+        if not app_data['success']:
             debug("Error: steam api returned success false")
             return f"(Unknown Game - AppID: {app_id})"
-        name = api_data[app_id]["data"]["name"]
+        name = app_data["data"]["name"]
         debug(f"Found game name from API: {name}")
 
         # Add to database
@@ -85,7 +79,7 @@ def get_game_name(app_id):
             debug(f"Added to database: {app_id} {name}")
         return name
 
-    except requests.exceptions.RequestException as e:
+    except (urllib.error.URLError, OSError) as e:
         debug(f"Error fetching game name from API: {e}")
         return f"(Unknown Game - AppID: {app_id})"
     except (json.JSONDecodeError, KeyError) as e:
@@ -96,15 +90,14 @@ def search_game_by_name(game_name):
     """Searches for a game on the Steam Store and returns a list of possible AppIDs and names."""
     debug(f"search_game_by_name called with game_name: {game_name}")
     try:
-        search_url = f"https://store.steampowered.com/api/storesearch/?term={game_name}&l=english&cc=us"  # search with English names
-        response = requests.get(search_url)
-        response.raise_for_status()
-        search_data = response.json()
+        search_url = f"https://store.steampowered.com/api/storesearch/?term={urllib.parse.quote(game_name)}&l=english&cc=us"  # search with English names
+        with urllib.request.urlopen(search_url, timeout=10) as response:
+            search_data = json.load(response)
         results = []
         for item in search_data["items"]:
             results.append((item["id"], item["name"]))
         return results
-    except requests.exceptions.RequestException as e:
+    except (urllib.error.URLError, OSError) as e:
         debug(f"Error searching for game: {e}")
         return []
     except (json.JSONDecodeError, KeyError) as e:
@@ -179,7 +172,7 @@ def open_in_editor(config_file):
         print(f"Error opening file with {get_editor()}: {e}")
 
 def toggle_disabled(config_file):
-    """Disables a config by renaming it to .disabled, or enables it again."""
+    """Disables a config by renaming it to .disabled, or enables it again. Returns the new path, or None on error."""
     name = get_game_name(os.path.basename(config_file).split(".")[0])
     if config_file.endswith(".disabled"):
         new_file = config_file[:-9]  # Remove .disabled
@@ -191,8 +184,10 @@ def toggle_disabled(config_file):
         os.rename(config_file, new_file)
         print(f"Configuration {action}: {name}")
         debug(f"Renamed {config_file} to {new_file}")
+        return new_file
     except OSError as e:
         print(f"Error renaming configuration: {e}")
+        return None
 
 def game_actions(config_file):
     """Side menu for a single game, opened with Right. Left or Back returns."""
@@ -409,6 +404,10 @@ def main():
     parser = argparse.ArgumentParser(description="ScopeBuddy configuration editor")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args()
+    if pick is None:
+        print("Error: The 'pick' module is not installed.")
+        print("Please install it using: pip install pick")
+        sys.exit(1)
     if args.debug:
         os.environ["DEBUG"] = "1"
     load_settings()

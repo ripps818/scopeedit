@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk, Pango
+
+import scopeedit as se
+
+# From /usr/bin/scopebuddy 1.5.0: (group, [(name, default, description)])
+LEGEND = [
+    ("Set in a config", [
+        ("SCB_GAMESCOPE_ARGS", "", "Default gamescope args. Ignored if args are given before -- in the launch options, unless SCB_APPENDMODE=1. Use += to add to it."),
+        ("SCB_APPENDMODE", "0", "1 = always put SCB_GAMESCOPE_ARGS in front of the launch option args instead of being replaced by them."),
+        ("SCB_AUTO_RES", "0", "1 = set -W/-H from the current display resolution."),
+        ("SCB_AUTO_HDR", "0", "1 = add --hdr-enabled if HDR is on for the display. Without gamescope on the desktop it also exports PROTON_ENABLE_WAYLAND=1 and PROTON_ENABLE_HDR=1."),
+        ("SCB_AUTO_VRR", "0", "1 = add --adaptive-sync if VRR is on for the display."),
+        ("SCB_AUTO_REFRESH", "0", "1 = set -r to the display refresh rate."),
+        ("SCB_AUTO_FRAME_LIMIT", "0", "1 = set --framerate-limit to the display refresh rate."),
+        ("SCB_NOSCOPE", "0", "1 = launch the game without gamescope."),
+        ("SCB_NESTEDFIX", "1", "Fix for the Steam overlay and Steam Input in nested gamescope. 0 disables it."),
+        ("SCB_DEBUG", "0", "1 = write the launch command to ~/.config/scopebuddy/scopebuddy.log."),
+        ("SCB_PRE_COMMAND", "", "Shell command run before gamescope starts (gamescope mode only)."),
+        ("SCB_POST_COMMAND", "", "Shell command run when the game exits."),
+    ]),
+    ("Launch options only", [
+        ("SCB_CONF", "scb.conf", "Global config to load. noscope.conf and gamemode.conf are picked automatically."),
+        ("SCB_APPID", "", "Override the detected AppID."),
+        ("SCB_STEAMARGIGNORE", "1", "Drop the -e/--steam gamescope flags, which currently crash gamescope."),
+        ("GAMESCOPE_BIN", "gamescope", "gamescope binary to run."),
+        ("KSCREEN_COMMAND", "kscreen-doctor", "KDE display tool used by SCB_AUTO_*."),
+        ("GDCTL_COMMAND", "gdctl", "GNOME display tool used by SCB_AUTO_*."),
+        ("GNOME_RANDR_COMMAND", "gnome-randr", "GNOME fallback display tool used by SCB_AUTO_*."),
+        ("WLR_RANDR_COMMAND", "wlr-randr", "wlroots display tool used by SCB_AUTO_*."),
+    ]),
+    ("Read-only, for scripting", [
+        ("SCB_CONFIGDIR", "", "The ScopeBuddy config folder, e.g. source $SCB_CONFIGDIR/hdr.conf"),
+        ("SCB_GAMEMODE", "", "1 when running in Steam Game Mode (SCB_NOSCOPE is then 1 too)."),
+        ("SCB_NOSCOPE", "", "1 when running without gamescope."),
+        ("SCB_APPID", "", "AppID of the game being launched."),
+        ("SCB_CONFIGFILE", "", "Full path of the global config that was loaded."),
+        ("SCB_VER", "", "ScopeBuddy version."),
+        ("command", "", "The expanded %command%. command+=\" ...\" adds game arguments."),
+    ]),
+]
+
+# (tag, regex, group), in increasing priority
+RULES = [
+    ("keyword", re.compile(r"\b(export|source|unset|local|if|then|else|elif|fi)\b"), 0),
+    ("variable", re.compile(r"^\s*(?:export\s+)?([A-Za-z_]\w*)(?=\+?=)", re.M), 1),
+    ("number", re.compile(r"(?<==)-?\d+(\.\d+)?\b"), 0),
+    ("string", re.compile(r'"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\''), 0),
+    ("flag", re.compile(r"(?<=[\s\"'])--?[A-Za-z][\w-]*"), 0),
+    ("expansion", re.compile(r"\$\{?[A-Za-z_]\w*\}?"), 0),
+]
+COMMENT = re.compile(r"(?:^|(?<=\s))#.*$", re.M)
+LIGHT = {"keyword": "#8839ef", "variable": "#1e66f5", "number": "#fe640b", "string": "#40a02b",
+         "flag": "#179299", "expansion": "#d20f39", "comment": "#8c8fa1"}
+DARK = {"keyword": "#cba6f7", "variable": "#89b4fa", "number": "#fab387", "string": "#a6e3a1",
+        "flag": "#94e2d5", "expansion": "#f38ba8", "comment": "#7f849c"}
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="scopeedit")
+        self.set_default_size(1200, 750)
+        self.current_path = None
+        self.paths = []  # path of each list row, by index
+        self.refreshing = False
+        self.dark = None
+
+        header = Gtk.HeaderBar()
+        self.set_titlebar(header)
+        self.save_button = Gtk.Button(label="Save", sensitive=False)
+        self.save_button.connect("clicked", lambda _: self.save())
+        header.pack_start(self.save_button)
+        self.legend_button = Gtk.ToggleButton(label="Variables", active=se.SETTINGS["show_legend"])
+        self.legend_button.connect("toggled", self.on_legend_toggled)
+        header.pack_end(self.legend_button)
+
+        save_action = Gio.SimpleAction.new("save", None)
+        save_action.connect("activate", lambda *_: self.save())
+        self.add_action(save_action)
+        app.set_accels_for_action("win.save", ["<Control>s"])
+
+        # Sidebar
+        self.global_button = Gtk.ToggleButton(label="Global")
+        self.global_button.connect("toggled", lambda _: self.refresh_list())
+        self.list_box = Gtk.ListBox()
+        self.list_box.connect("row-selected", self.on_row_selected)
+        new_button = Gtk.Button(label="New", hexpand=True)
+        new_button.connect("clicked", self.on_new)
+        self.toggle_button = Gtk.Button(label="Disable", hexpand=True, sensitive=False)
+        self.toggle_button.connect("clicked", self.on_toggle_disabled)
+        show_disabled = Gtk.CheckButton(label="Show disabled", active=se.SETTINGS["show_hidden"])
+        show_disabled.connect("toggled", self.on_show_disabled)
+        buttons = Gtk.Box(spacing=6)
+        buttons.append(new_button)
+        buttons.append(self.toggle_button)
+        self.game_controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.game_controls.append(buttons)
+        self.game_controls.append(show_disabled)
+
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                          margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        sidebar.append(self.global_button)
+        sidebar.append(Gtk.ScrolledWindow(child=self.list_box, vexpand=True,
+                                          hscrollbar_policy=Gtk.PolicyType.NEVER))
+        sidebar.append(self.game_controls)
+
+        # Editor
+        self.buffer = Gtk.TextBuffer()
+        for name in LIGHT:
+            tag = self.buffer.create_tag(name)
+            if name == "comment":
+                tag.props.style = Pango.Style.ITALIC
+        self.buffer.connect("changed", lambda _: self.highlight())
+        self.buffer.connect("modified-changed", lambda _: self.update_title())
+        self.editor = Gtk.TextView(buffer=self.buffer, monospace=True, sensitive=False,
+                                   left_margin=8, right_margin=8, top_margin=8, bottom_margin=8)
+
+        self.revealer = Gtk.Revealer(child=self.build_legend(), reveal_child=se.SETTINGS["show_legend"],
+                                     transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT)
+        right = Gtk.Box()
+        right.append(Gtk.ScrolledWindow(child=self.editor, hexpand=True))
+        right.append(self.revealer)
+
+        paned = Gtk.Paned(start_child=sidebar, end_child=right, position=300,
+                          shrink_start_child=False, resize_start_child=False)
+        self.set_child(paned)
+        self.connect("close-request", self.on_close_request)
+        self.refresh_list()
+
+    def build_legend(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
+        for group, entries in LEGEND:
+            heading = Gtk.Label(label=group, xalign=0, margin_top=10, margin_bottom=4)
+            heading.add_css_class("heading")
+            box.append(heading)
+            for name, default, description in entries:
+                markup = f"<b><tt>{GLib.markup_escape_text(name)}</tt></b>"
+                if default:
+                    markup += f"  <small>default: {GLib.markup_escape_text(default)}</small>"
+                box.append(Gtk.Label(label=markup, use_markup=True, xalign=0, selectable=True, margin_top=6))
+                desc = Gtk.Label(label=description, xalign=0, wrap=True, selectable=True, max_width_chars=38)
+                desc.add_css_class("dim-label")
+                box.append(desc)
+        return Gtk.ScrolledWindow(child=box, width_request=340, hscrollbar_policy=Gtk.PolicyType.NEVER)
+
+    def refresh_list(self):
+        self.refreshing = True
+        self.list_box.remove_all()
+        if self.global_button.get_active():
+            files = sorted(f for f in os.listdir(se.CONFIG_DIR) if f.endswith(".conf"))
+            items = [(f, os.path.join(se.CONFIG_DIR, f)) for f in files]
+        else:
+            items = se.get_game_configs()
+        self.paths = [path for _, path in items]
+        for label, path in items:
+            row_label = Gtk.Label(label=label, xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                                  margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            if path.endswith(".disabled"):
+                row_label.add_css_class("dim-label")
+            self.list_box.append(row_label)
+        self.game_controls.set_visible(not self.global_button.get_active())
+        self.select_path(self.current_path)
+        self.refreshing = False
+
+    def select_path(self, path):
+        was_refreshing = self.refreshing
+        self.refreshing = True
+        if path in self.paths:
+            self.list_box.select_row(self.list_box.get_row_at_index(self.paths.index(path)))
+        else:
+            self.list_box.unselect_all()
+        self.refreshing = was_refreshing
+
+    def on_row_selected(self, _, row):
+        if self.refreshing or row is None:
+            return
+        path = self.paths[row.get_index()]
+        if path == self.current_path:
+            return
+        # Keep the open file selected until any unsaved changes are resolved
+        self.select_path(self.current_path)
+        self.confirm_discard(lambda: self.open_file(path))
+
+    def open_file(self, path):
+        with open(path, "r") as f:
+            text = f.read()
+        self.current_path = path
+        # Sensitive first: highlight() picks the palette from the editor's text color
+        self.editor.set_sensitive(True)
+        self.buffer.set_text(text)
+        self.buffer.set_modified(False)
+        self.select_path(path)
+        self.update_title()
+
+    def update_title(self):
+        modified = self.buffer.get_modified()
+        self.save_button.set_sensitive(modified)
+        is_game = self.current_path is not None and os.path.dirname(self.current_path) == se.APPID_DIR
+        self.toggle_button.set_sensitive(is_game)
+        if is_game:
+            self.toggle_button.set_label("Enable" if self.current_path.endswith(".disabled") else "Disable")
+        if self.current_path is None:
+            self.set_title("scopeedit")
+            return
+        file_name = os.path.basename(self.current_path)
+        title = f"{se.get_game_name(file_name.split('.')[0])} ({file_name})" if is_game else file_name
+        self.set_title(f"{'* ' if modified else ''}{title}")
+
+    def save(self):
+        """Writes the editor to the open file. Returns False if it could not be saved."""
+        if self.current_path is None:
+            return True
+        start, end = self.buffer.get_bounds()
+        try:
+            with open(self.current_path, "w") as f:
+                f.write(self.buffer.get_text(start, end, True))
+        except OSError as e:
+            Gtk.AlertDialog(message="Could not save", detail=str(e)).show(self)
+            return False
+        self.buffer.set_modified(False)
+        return True
+
+    def confirm_discard(self, then):
+        """Calls then() once unsaved changes are saved or discarded. Does nothing on Cancel."""
+        if not self.buffer.get_modified():
+            then()
+            return
+
+        def done(dialog, result):
+            choice = dialog.choose_finish(result)
+            if choice == 2 and self.save() or choice == 1:
+                then()
+
+        Gtk.AlertDialog(message=f"Save changes to {os.path.basename(self.current_path)}?",
+                        buttons=["Cancel", "Discard", "Save"], cancel_button=0,
+                        default_button=2).choose(self, None, done)
+
+    def on_close_request(self, _):
+        if not self.buffer.get_modified():
+            return False
+        self.confirm_discard(self.destroy)
+        return True
+
+    def highlight(self):
+        fg = self.editor.get_color()
+        dark = (fg.red + fg.green + fg.blue) / 3 > 0.5
+        if dark != self.dark:
+            self.dark = dark
+            table = self.buffer.get_tag_table()
+            for name, color in (DARK if dark else LIGHT).items():
+                table.lookup(name).props.foreground = color
+
+        start, end = self.buffer.get_bounds()
+        self.buffer.remove_all_tags(start, end)
+        text = self.buffer.get_text(start, end, True)
+
+        def tag(name, a, b):
+            self.buffer.apply_tag_by_name(name, self.buffer.get_iter_at_offset(a), self.buffer.get_iter_at_offset(b))
+
+        strings = []
+        for name, regex, group in RULES:
+            for m in regex.finditer(text):
+                tag(name, m.start(group), m.end(group))
+                if name == "string":
+                    strings.append(m.span())
+        for m in COMMENT.finditer(text):
+            if not any(a < m.start() < b for a, b in strings):
+                tag("comment", m.start(), m.end())
+
+    def on_legend_toggled(self, button):
+        self.revealer.set_reveal_child(button.get_active())
+        se.SETTINGS["show_legend"] = button.get_active()
+        se.save_settings()
+
+    def on_show_disabled(self, button):
+        se.SETTINGS["show_hidden"] = button.get_active()
+        se.save_settings()
+        self.refresh_list()
+
+    def on_toggle_disabled(self, _):
+        new_path = se.toggle_disabled(self.current_path)
+        if new_path:
+            self.current_path = new_path
+            self.refresh_list()
+            self.update_title()
+
+    def show_game(self, path):
+        self.global_button.set_active(False)
+        self.refresh_list()
+        self.open_file(path)
+
+    def create_config(self, app_id):
+        path = os.path.join(se.APPID_DIR, f"{app_id}.conf")
+        disabled_path = path + ".disabled"
+        name = se.get_game_name(app_id)
+        if os.path.exists(path):
+            self.show_game(path)
+        elif os.path.exists(disabled_path):
+            def done(dialog, result):
+                if dialog.choose_finish(result) == 1:
+                    new_path = se.toggle_disabled(disabled_path)
+                    if new_path:
+                        self.show_game(new_path)
+
+            Gtk.AlertDialog(message=f"A disabled config for {name} exists.", detail="Re-enable it?",
+                            buttons=["Cancel", "Re-enable"], cancel_button=0,
+                            default_button=1).choose(self, None, done)
+        else:
+            with open(path, "w") as f:
+                f.write(f"# {name}\n")
+            self.show_game(path)
+
+    def on_new(self, _):
+        dialog = Gtk.Window(title="New Configuration", transient_for=self, modal=True,
+                            default_width=460, default_height=460)
+        name_entry = Gtk.SearchEntry(placeholder_text="Game name, press Enter to search")
+        status = Gtk.Label(xalign=0)
+        status.add_css_class("dim-label")
+        results = Gtk.ListBox()
+        appid_entry = Gtk.Entry(placeholder_text="AppID")
+        create = Gtk.Button(label="Create")
+        create.add_css_class("suggested-action")
+        found = []
+
+        def search(_):
+            results.remove_all()
+            found.clear()
+            for app_id, name in se.search_game_by_name(name_entry.get_text()):
+                found.append(str(app_id))
+                results.append(Gtk.Label(label=f"{name} ({app_id})", xalign=0, margin_top=4,
+                                         margin_bottom=4, margin_start=6, margin_end=6))
+            status.set_text(f"{len(found)} found" if found else "No games found, enter the AppID below.")
+
+        def select(_, row):
+            if row is not None:
+                appid_entry.set_text(found[row.get_index()])
+
+        def do_create(_):
+            app_id = appid_entry.get_text().strip()
+            if not app_id.isdigit():
+                appid_entry.add_css_class("error")
+                return
+            dialog.close()
+            self.confirm_discard(lambda: self.create_config(app_id))
+
+        name_entry.connect("activate", search)
+        results.connect("row-selected", select)
+        appid_entry.connect("activate", do_create)
+        create.connect("clicked", do_create)
+
+        bottom = Gtk.Box(spacing=6)
+        appid_entry.set_hexpand(True)
+        bottom.append(appid_entry)
+        bottom.append(create)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        box.append(name_entry)
+        box.append(status)
+        box.append(Gtk.ScrolledWindow(child=results, vexpand=True))
+        box.append(bottom)
+        dialog.set_child(box)
+        dialog.present()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="local.scopeedit.Gui")
+
+    def do_activate(self):
+        window = self.props.active_window or Window(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    se.load_settings()
+    sys.exit(App().run(sys.argv))
