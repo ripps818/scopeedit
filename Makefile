@@ -14,8 +14,7 @@ install:
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(APPDIR)
 	ln -sf $(DATADIR)/scopeedit $(DESTDIR)$(BINDIR)/scopeedit
 	ln -sf $(DATADIR)/scopeedit-gui $(DESTDIR)$(BINDIR)/scopeedit-gui
-	printf '[Desktop Entry]\nType=Application\nName=scopeedit\nComment=Edit ScopeBuddy configs\nExec=%s\nIcon=applications-games\nTerminal=false\nCategories=Game;\n' \
-		"$(BINDIR)/scopeedit-gui" > $(DESTDIR)$(DESKTOP)
+	sed 's|@BINDIR@|$(BINDIR)|' local.scopeedit.Gui.desktop > $(DESTDIR)$(DESKTOP)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/scopeedit $(DESTDIR)$(BINDIR)/scopeedit-gui $(DESTDIR)$(DESKTOP)

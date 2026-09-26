@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=scopeedit
+GenericName=ScopeBuddy Config Editor
+Comment=Edit ScopeBuddy configs
+Exec=@BINDIR@/scopeedit-gui
+Icon=applications-games
+Terminal=false
+Categories=Game;
+Keywords=scopebuddy;gamescope;proton;steam;
